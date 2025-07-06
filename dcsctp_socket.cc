@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -216,11 +217,26 @@ namespace dcsctp
                     options_.max_send_buffer_size,
                     options_.mtu,
                     options_.default_stream_priority,
-                    options_.total_buffered_amount_low_threshold) {}
-
-  std::string DcSctpSocket::log_prefix() const
+                    options_.total_buffered_amount_low_threshold)
   {
-    return log_prefix_ + "[" + std::string(ToString(state_)) + "] ";
+    // 预计算缓存的日志前缀
+    UpdateCachedLogPrefix();
+  }
+
+  const std::string &DcSctpSocket::log_prefix() const
+  {
+    // 使用缓存避免重复的字符串拼接
+    if (last_cached_state_ != state_)
+    {
+      UpdateCachedLogPrefix();
+    }
+    return cached_log_prefix_;
+  }
+
+  void DcSctpSocket::UpdateCachedLogPrefix() const
+  {
+    cached_log_prefix_ = log_prefix_ + "[" + std::string(ToString(state_)) + "] ";
+    last_cached_state_ = state_;
   }
 
   bool DcSctpSocket::IsConsistent() const
@@ -473,26 +489,59 @@ namespace dcsctp
 
   void DcSctpSocket::InternalClose(ErrorKind error, absl::string_view message)
   {
-    if (state_ != State::kClosed)
+    if (state_ == State::kClosed)
     {
-      t1_init_->Stop();
-      t1_cookie_->Stop();
-      t2_shutdown_->Stop();
-      tcb_ = nullptr;
-
-      if (error == ErrorKind::kNoError)
-      {
-        callbacks_.OnClosed();
-      }
-      else
-      {
-        callbacks_.OnAborted(error, message);
-      }
-      SetState(State::kClosed, message);
+      return;
     }
-    // This method's purpose is to abort/close and make it consistent by ensuring
-    // that e.g. all timers really are stopped.
+
+    // 使用RAII模式确保资源清理的异常安全性
+    try
+    {
+      // 停止所有定时器
+      StopAllTimers();
+
+      // 清理TCB资源
+      CleanupTcb();
+
+      // 更新状态
+      SetState(State::kClosed, message);
+
+      // 通知回调
+      NotifyConnectionClosed(error, message);
+    }
+    catch (...)
+    {
+      // 即使在异常情况下也要确保状态一致性
+      SetState(State::kClosed, "Exception during close");
+      throw;
+    }
+
+    // 确保最终状态一致
     RTC_DCHECK(IsConsistent());
+  }
+
+  void DcSctpSocket::StopAllTimers()
+  {
+    t1_init_->Stop();
+    t1_cookie_->Stop();
+    t2_shutdown_->Stop();
+  }
+
+  void DcSctpSocket::CleanupTcb()
+  {
+    tcb_.reset(); // 使用 reset() 而不是 = nullptr，更明确表达意图
+  }
+
+  void DcSctpSocket::NotifyConnectionClosed(ErrorKind error, absl::string_view message)
+  {
+    if (error == ErrorKind::kNoError)
+    {
+      callbacks_.OnClosed();
+    }
+    else
+    {
+      callbacks_.OnAborted(error, message);
+    }
   }
 
   void DcSctpSocket::SetStreamPriority(StreamID stream_id,
@@ -512,65 +561,101 @@ namespace dcsctp
   {
     RTC_DCHECK_RUN_ON(&thread_checker_);
     CallbackDeferrer::ScopedDeferrer deferrer(callbacks_);
-    LifecycleId lifecycle_id = send_options.lifecycle_id;
 
-    if (message.payload().empty())
+    // 使用 RAII 模式确保 lifecycle 在所有错误路径中都被正确处理
+    LifecycleGuard lifecycle_guard(send_options.lifecycle_id, callbacks_);
+
+    // 验证消息有效性
+    if (auto status = ValidateMessage(message); status != SendStatus::kSuccess)
     {
-      if (lifecycle_id.IsSet())
-      {
-        callbacks_.OnLifecycleEnd(lifecycle_id);
-      }
-      callbacks_.OnError(ErrorKind::kProtocolViolation,
-                         "Unable to send empty message");
-      return SendStatus::kErrorMessageEmpty;
+      return status;
     }
-    if (message.payload().size() > options_.max_message_size)
+
+    // 检查连接状态
+    if (IsShuttingDown())
     {
-      if (lifecycle_id.IsSet())
-      {
-        callbacks_.OnLifecycleEnd(lifecycle_id);
-      }
-      callbacks_.OnError(ErrorKind::kProtocolViolation,
-                         "Unable to send too large message");
-      return SendStatus::kErrorMessageTooLarge;
-    }
-    if (state_ == State::kShutdownPending || state_ == State::kShutdownSent ||
-        state_ == State::kShutdownReceived || state_ == State::kShutdownAckSent)
-    {
-      // https://tools.ietf.org/html/rfc4960#section-9.2
-      // "An endpoint should reject any new data request from its upper layer
-      // if it is in the SHUTDOWN-PENDING, SHUTDOWN-SENT, SHUTDOWN-RECEIVED, or
-      // SHUTDOWN-ACK-SENT state."
-      if (lifecycle_id.IsSet())
-      {
-        callbacks_.OnLifecycleEnd(lifecycle_id);
-      }
       callbacks_.OnError(ErrorKind::kWrongSequence,
                          "Unable to send message as the socket is shutting down");
       return SendStatus::kErrorShuttingDown;
     }
+
+    // 检查发送队列状态
     if (send_queue_.IsFull())
     {
-      if (lifecycle_id.IsSet())
-      {
-        callbacks_.OnLifecycleEnd(lifecycle_id);
-      }
       callbacks_.OnError(ErrorKind::kResourceExhaustion,
                          "Unable to send message as the send queue is full");
       return SendStatus::kErrorResourceExhaustion;
     }
 
+    // 执行发送操作
     TimeMs now = callbacks_.TimeMillis();
     ++metrics_.tx_messages_count;
     send_queue_.Add(now, std::move(message), send_options);
+
     if (tcb_ != nullptr)
     {
       tcb_->SendBufferedPackets(now);
     }
 
+    // 发送成功，取消 lifecycle guard
+    lifecycle_guard.Success();
+
     RTC_DCHECK(IsConsistent());
     return SendStatus::kSuccess;
   }
+
+  SendStatus DcSctpSocket::ValidateMessage(const DcSctpMessage &message) const
+  {
+    if (message.payload().empty())
+    {
+      callbacks_.OnError(ErrorKind::kProtocolViolation,
+                         "Unable to send empty message");
+      return SendStatus::kErrorMessageEmpty;
+    }
+
+    if (message.payload().size() > options_.max_message_size)
+    {
+      callbacks_.OnError(ErrorKind::kProtocolViolation,
+                         "Unable to send too large message");
+      return SendStatus::kErrorMessageTooLarge;
+    }
+
+    return SendStatus::kSuccess;
+  }
+
+  bool DcSctpSocket::IsShuttingDown() const
+  {
+    return state_ == State::kShutdownPending ||
+           state_ == State::kShutdownSent ||
+           state_ == State::kShutdownReceived ||
+           state_ == State::kShutdownAckSent;
+  }
+
+  // RAII 类用于管理 lifecycle
+  class DcSctpSocket::LifecycleGuard
+  {
+  public:
+    LifecycleGuard(LifecycleId lifecycle_id, CallbackDeferrer &callbacks)
+        : lifecycle_id_(lifecycle_id), callbacks_(callbacks), should_end_(lifecycle_id.IsSet()) {}
+
+    ~LifecycleGuard()
+    {
+      if (should_end_)
+      {
+        callbacks_.OnLifecycleEnd(lifecycle_id_);
+      }
+    }
+
+    void Success()
+    {
+      should_end_ = false; // 成功时不需要结束 lifecycle
+    }
+
+  private:
+    LifecycleId lifecycle_id_;
+    CallbackDeferrer &callbacks_;
+    bool should_end_;
+  };
 
   ResetStreamsStatus DcSctpSocket::ResetStreams(
       rtc::ArrayView<const StreamID> outgoing_streams)
@@ -906,63 +991,36 @@ namespace dcsctp
   bool DcSctpSocket::Dispatch(const CommonHeader &header,
                               const SctpPacket::ChunkDescriptor &descriptor)
   {
-    switch (descriptor.type)
+    // 使用函数指针映射表提高性能，避免长switch语句
+    using ChunkHandler = void (DcSctpSocket::*)(const CommonHeader &, const SctpPacket::ChunkDescriptor &);
+
+    static const std::unordered_map<uint8_t, ChunkHandler> kChunkHandlers = {
+        {DataChunk::kType, &DcSctpSocket::HandleData},
+        {InitChunk::kType, &DcSctpSocket::HandleInit},
+        {InitAckChunk::kType, &DcSctpSocket::HandleInitAck},
+        {SackChunk::kType, &DcSctpSocket::HandleSack},
+        {HeartbeatRequestChunk::kType, &DcSctpSocket::HandleHeartbeatRequest},
+        {HeartbeatAckChunk::kType, &DcSctpSocket::HandleHeartbeatAck},
+        {AbortChunk::kType, &DcSctpSocket::HandleAbort},
+        {ErrorChunk::kType, &DcSctpSocket::HandleError},
+        {CookieEchoChunk::kType, &DcSctpSocket::HandleCookieEcho},
+        {CookieAckChunk::kType, &DcSctpSocket::HandleCookieAck},
+        {ShutdownChunk::kType, &DcSctpSocket::HandleShutdown},
+        {ShutdownAckChunk::kType, &DcSctpSocket::HandleShutdownAck},
+        {ShutdownCompleteChunk::kType, &DcSctpSocket::HandleShutdownComplete},
+        {ReConfigChunk::kType, &DcSctpSocket::HandleReconfig},
+        {ForwardTsnChunk::kType, &DcSctpSocket::HandleForwardTsn},
+        {IDataChunk::kType, &DcSctpSocket::HandleIData},
+        {IForwardTsnChunk::kType, &DcSctpSocket::HandleIForwardTsn}};
+
+    auto it = kChunkHandlers.find(descriptor.type);
+    if (it != kChunkHandlers.end())
     {
-    case DataChunk::kType:
-      HandleData(header, descriptor);
-      break;
-    case InitChunk::kType:
-      HandleInit(header, descriptor);
-      break;
-    case InitAckChunk::kType:
-      HandleInitAck(header, descriptor);
-      break;
-    case SackChunk::kType:
-      HandleSack(header, descriptor);
-      break;
-    case HeartbeatRequestChunk::kType:
-      HandleHeartbeatRequest(header, descriptor);
-      break;
-    case HeartbeatAckChunk::kType:
-      HandleHeartbeatAck(header, descriptor);
-      break;
-    case AbortChunk::kType:
-      HandleAbort(header, descriptor);
-      break;
-    case ErrorChunk::kType:
-      HandleError(header, descriptor);
-      break;
-    case CookieEchoChunk::kType:
-      HandleCookieEcho(header, descriptor);
-      break;
-    case CookieAckChunk::kType:
-      HandleCookieAck(header, descriptor);
-      break;
-    case ShutdownChunk::kType:
-      HandleShutdown(header, descriptor);
-      break;
-    case ShutdownAckChunk::kType:
-      HandleShutdownAck(header, descriptor);
-      break;
-    case ShutdownCompleteChunk::kType:
-      HandleShutdownComplete(header, descriptor);
-      break;
-    case ReConfigChunk::kType:
-      HandleReconfig(header, descriptor);
-      break;
-    case ForwardTsnChunk::kType:
-      HandleForwardTsn(header, descriptor);
-      break;
-    case IDataChunk::kType:
-      HandleIData(header, descriptor);
-      break;
-    case IForwardTsnChunk::kType:
-      HandleIForwardTsn(header, descriptor);
-      break;
-    default:
-      return HandleUnrecognizedChunk(descriptor);
+      (this->*(it->second))(header, descriptor);
+      return true;
     }
-    return true;
+
+    return HandleUnrecognizedChunk(descriptor);
   }
 
   bool DcSctpSocket::HandleUnrecognizedChunk(
@@ -1162,6 +1220,28 @@ namespace dcsctp
     AnyDataChunk::ImmediateAckFlag immediate_ack = chunk.options().immediate_ack;
     Data data = std::move(chunk).extract();
 
+    // 验证数据块的有效性
+    if (!ValidateDataChunk(data, tsn))
+    {
+      return;
+    }
+
+    LogDataChunkInfo();
+
+    // 检查重组队列状态
+    auto queue_status = CheckReassemblyQueueStatus(tsn);
+    if (queue_status != ReassemblyQueueStatus::kOk)
+    {
+      HandleReassemblyQueueError(queue_status);
+      return;
+    }
+
+    // 处理数据块
+    ProcessValidDataChunk(tsn, std::move(data), immediate_ack);
+  }
+
+  bool DcSctpSocket::ValidateDataChunk(const Data &data, TSN tsn)
+  {
     if (data.payload.empty())
     {
       // Empty DATA chunks are illegal.
@@ -1169,9 +1249,21 @@ namespace dcsctp
           ErrorChunk(Parameters::Builder().Add(NoUserDataCause(tsn)).Build())));
       callbacks_.OnError(ErrorKind::kProtocolViolation,
                          "Received DATA chunk with no user data");
-      return;
+      return false;
     }
 
+    if (!tcb_->data_tracker().IsTSNValid(tsn))
+    {
+      RTC_DLOG(LS_VERBOSE) << log_prefix()
+                           << "Rejected data because of failing TSN validity";
+      return false;
+    }
+
+    return true;
+  }
+
+  void DcSctpSocket::LogDataChunkInfo() const
+  {
     RTC_DLOG(LS_VERBOSE) << log_prefix() << "Handle DATA, queue_size="
                          << tcb_->reassembly_queue().queued_bytes()
                          << ", water_mark="
@@ -1179,42 +1271,62 @@ namespace dcsctp
                          << ", full=" << tcb_->reassembly_queue().is_full()
                          << ", above="
                          << tcb_->reassembly_queue().is_above_watermark();
+  }
 
+  enum class DcSctpSocket::ReassemblyQueueStatus
+  {
+    kOk,
+    kFull,
+    kAboveWatermark
+  };
+
+  DcSctpSocket::ReassemblyQueueStatus DcSctpSocket::CheckReassemblyQueueStatus(TSN tsn)
+  {
     if (tcb_->reassembly_queue().is_full())
     {
-      // If the reassembly queue is full, there is nothing that can be done. The
-      // specification only allows dropping gap-ack-blocks, and that's not
-      // likely to help as the socket has been trying to fill gaps since the
-      // watermark was reached.
-      packet_sender_.Send(tcb_->PacketBuilder().Add(AbortChunk(
-          true, Parameters::Builder().Add(OutOfResourceErrorCause()).Build())));
-      InternalClose(ErrorKind::kResourceExhaustion,
-                    "Reassembly Queue is exhausted");
-      return;
+      return ReassemblyQueueStatus::kFull;
     }
 
     if (tcb_->reassembly_queue().is_above_watermark())
     {
       RTC_DLOG(LS_VERBOSE) << log_prefix() << "Is above high watermark";
-      // If the reassembly queue is above its high watermark, only accept data
-      // chunks that increase its cumulative ack tsn in an attempt to fill gaps
-      // to deliver messages.
+
+      // 如果重组队列高于高水位，只接受能增加累积确认TSN的数据块
       if (!tcb_->data_tracker().will_increase_cum_ack_tsn(tsn))
       {
-        RTC_DLOG(LS_VERBOSE) << log_prefix()
-                             << "Rejected data because of exceeding watermark";
-        tcb_->data_tracker().ForceImmediateSack();
-        return;
+        return ReassemblyQueueStatus::kAboveWatermark;
       }
     }
 
-    if (!tcb_->data_tracker().IsTSNValid(tsn))
-    {
-      RTC_DLOG(LS_VERBOSE) << log_prefix()
-                           << "Rejected data because of failing TSN validity";
-      return;
-    }
+    return ReassemblyQueueStatus::kOk;
+  }
 
+  void DcSctpSocket::HandleReassemblyQueueError(ReassemblyQueueStatus status)
+  {
+    switch (status)
+    {
+    case ReassemblyQueueStatus::kFull:
+      // 重组队列已满，无法处理
+      packet_sender_.Send(tcb_->PacketBuilder().Add(AbortChunk(
+          true, Parameters::Builder().Add(OutOfResourceErrorCause()).Build())));
+      InternalClose(ErrorKind::kResourceExhaustion,
+                    "Reassembly Queue is exhausted");
+      break;
+
+    case ReassemblyQueueStatus::kAboveWatermark:
+      RTC_DLOG(LS_VERBOSE) << log_prefix()
+                           << "Rejected data because of exceeding watermark";
+      tcb_->data_tracker().ForceImmediateSack();
+      break;
+
+    default:
+      break;
+    }
+  }
+
+  void DcSctpSocket::ProcessValidDataChunk(TSN tsn, Data data,
+                                           AnyDataChunk::ImmediateAckFlag immediate_ack)
+  {
     if (tcb_->data_tracker().Observe(tsn, immediate_ack))
     {
       tcb_->reassembly_queue().MaybeResetStreamsDeferred(
