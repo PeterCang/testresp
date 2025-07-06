@@ -6,14 +6,6 @@
  *  tree. An additional intellectual property rights grant can be found
  *  in the file PATENTS.  All contributing project authors may
  *  be found in the AUTHORS file in the root of the source tree.
- *
- *  OPTIMIZATIONS APPLIED:
- *  1. Extracted common constants to reduce code duplication
- *  2. Added helper functions for error handling and validation
- *  3. Optimized string concatenation with thread-local caching
- *  4. Improved early exit patterns for better performance
- *  5. Reduced repetitive code in validation logic
- *  6. Created reusable functions for packet creation
  */
 #include "net/dcsctp/socket/dcsctp_socket.h"
 
@@ -22,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -91,104 +84,6 @@ namespace dcsctp
 {
   namespace
   {
-
-    // Constants for validation ranges
-    constexpr uint32_t kMinVerificationTag = 1;
-    constexpr uint32_t kMaxVerificationTag = std::numeric_limits<uint32_t>::max();
-    constexpr uint32_t kMinInitialTsn = 0;
-    constexpr uint32_t kMaxInitialTsn = std::numeric_limits<uint32_t>::max();
-
-    // Common error messages
-    constexpr absl::string_view kInvalidInitMessage = "INIT malformed";
-    constexpr absl::string_view kInvalidInitAckMessage = "INIT-ACK malformed";
-    constexpr absl::string_view kCloseCalledMessage = "Close called";
-    constexpr absl::string_view kTooManyRetransmissionsMessage = "Too many retransmissions";
-    constexpr absl::string_view kTooManyShutdownRetransmissionsMessage = "Too many retransmissions of SHUTDOWN";
-
-    // Helper function to handle lifecycle cleanup
-    inline void CleanupLifecycleIfSet(DcSctpSocketCallbacks &callbacks,
-                                      LifecycleId lifecycle_id)
-    {
-      if (lifecycle_id.IsSet())
-      {
-        callbacks.OnLifecycleEnd(lifecycle_id);
-      }
-    }
-
-    // Helper function to validate message for sending
-    struct SendValidationResult
-    {
-      SendStatus status;
-      bool is_valid;
-
-      SendValidationResult(SendStatus s, bool v) : status(s), is_valid(v) {}
-    };
-
-    SendValidationResult ValidateMessageForSending(const DcSctpMessage &message,
-                                                   const DcSctpOptions &options,
-                                                   DcSctpSocket::State state)
-    {
-      if (message.payload().empty())
-      {
-        return {SendStatus::kErrorMessageEmpty, false};
-      }
-
-      if (message.payload().size() > options.max_message_size)
-      {
-        return {SendStatus::kErrorMessageTooLarge, false};
-      }
-
-      // Check if socket is in shutting down state
-      if (IsShuttingDownState(state))
-      {
-        return {SendStatus::kErrorShuttingDown, false};
-      }
-
-      return {SendStatus::kSuccess, true};
-    }
-
-    // Helper function to check if state is shutting down
-    inline bool IsShuttingDownState(DcSctpSocket::State state)
-    {
-      return state == DcSctpSocket::State::kShutdownPending ||
-             state == DcSctpSocket::State::kShutdownSent ||
-             state == DcSctpSocket::State::kShutdownReceived ||
-             state == DcSctpSocket::State::kShutdownAckSent;
-    }
-
-    // Helper function to create abort chunk with error message
-    SctpPacket::Builder CreateAbortChunk(VerificationTag verification_tag,
-                                         const DcSctpOptions &options,
-                                         absl::string_view message,
-                                         bool filled_in_verification_tag = true)
-    {
-      SctpPacket::Builder builder(verification_tag, options);
-      builder.Add(AbortChunk(filled_in_verification_tag,
-                             Parameters::Builder()
-                                 .Add(UserInitiatedAbortCause(message))
-                                 .Build()));
-      return builder;
-    }
-
-    // Helper function to create protocol violation abort
-    SctpPacket::Builder CreateProtocolViolationAbort(VerificationTag verification_tag,
-                                                     const DcSctpOptions &options,
-                                                     absl::string_view message)
-    {
-      SctpPacket::Builder builder(verification_tag, options);
-      builder.Add(AbortChunk(false,
-                             Parameters::Builder()
-                                 .Add(ProtocolViolationCause(message))
-                                 .Build()));
-      return builder;
-    }
-
-    // Helper function to validate chunk parsing
-    template <typename T>
-    bool ValidateParseSuccess(const absl::optional<T> &chunk)
-    {
-      return chunk.has_value();
-    }
 
     // https://tools.ietf.org/html/rfc4960#section-5.1
     constexpr uint32_t kMinVerificationTag = 1;
@@ -277,11 +172,21 @@ namespace dcsctp
     }
   } // namespace
 
+  // 常量定义，替代魔法数字
+  namespace
+  {
+    constexpr size_t kCookieMagicSize = 8;
+    constexpr absl::string_view kDcSctpMagic = "dcSCTP00";
+    constexpr absl::string_view kUsrSctpMagic = "KAME-BSD";
+  } // namespace
+
   DcSctpSocket::DcSctpSocket(absl::string_view log_prefix,
                              DcSctpSocketCallbacks &callbacks,
                              std::unique_ptr<PacketObserver> packet_observer,
                              const DcSctpOptions &options)
       : log_prefix_(std::string(log_prefix) + ": "),
+        cached_log_prefix_(log_prefix_),
+        last_cached_state_(State::kClosed),
         packet_observer_(std::move(packet_observer)),
         options_(options),
         callbacks_(callbacks),
@@ -312,20 +217,26 @@ namespace dcsctp
                     options_.max_send_buffer_size,
                     options_.mtu,
                     options_.default_stream_priority,
-                    options_.total_buffered_amount_low_threshold) {}
-
-  std::string DcSctpSocket::log_prefix() const
+                    options_.total_buffered_amount_low_threshold)
   {
-    // Cache the string to avoid repeated concatenations
-    static thread_local std::string cached_prefix;
-    static thread_local State cached_state = State::kClosed;
+    // 预计算缓存的日志前缀
+    UpdateCachedLogPrefix();
+  }
 
-    if (cached_state != state_)
+  const std::string &DcSctpSocket::log_prefix() const
+  {
+    // 使用缓存避免重复的字符串拼接
+    if (last_cached_state_ != state_)
     {
-      cached_state = state_;
-      cached_prefix = log_prefix_ + "[" + std::string(ToString(state_)) + "] ";
+      UpdateCachedLogPrefix();
     }
-    return cached_prefix;
+    return cached_log_prefix_;
+  }
+
+  void DcSctpSocket::UpdateCachedLogPrefix() const
+  {
+    cached_log_prefix_ = log_prefix_ + "[" + std::string(ToString(state_)) + "] ";
+    last_cached_state_ = state_;
   }
 
   bool DcSctpSocket::IsConsistent() const
@@ -391,7 +302,7 @@ namespace dcsctp
   {
     if (state_ != state)
     {
-      RTC_DLOG(LS_VERBOSE) << log_prefix() << "Socket state changed from "
+      RTC_DLOG(LS_VERBOSE) << log_prefix_ << "Socket state changed from "
                            << ToString(state_) << " to " << ToString(state)
                            << " due to " << reason;
       state_ = state;
@@ -551,9 +462,12 @@ namespace dcsctp
     {
       if (tcb_ != nullptr)
       {
-        packet_sender_.Send(CreateAbortChunk(tcb_->peer_verification_tag(),
-                                             options_,
-                                             kCloseCalledMessage));
+        SctpPacket::Builder b = tcb_->PacketBuilder();
+        b.Add(AbortChunk(/*filled_in_verification_tag=*/true,
+                         Parameters::Builder()
+                             .Add(UserInitiatedAbortCause("Close called"))
+                             .Build()));
+        packet_sender_.Send(b);
       }
       InternalClose(ErrorKind::kNoError, "");
     }
@@ -566,34 +480,68 @@ namespace dcsctp
 
   void DcSctpSocket::CloseConnectionBecauseOfTooManyTransmissionErrors()
   {
-    packet_sender_.Send(CreateAbortChunk(tcb_->peer_verification_tag(),
-                                         options_,
-                                         kTooManyRetransmissionsMessage));
-    InternalClose(ErrorKind::kTooManyRetries, kTooManyRetransmissionsMessage);
+    packet_sender_.Send(tcb_->PacketBuilder().Add(AbortChunk(
+        true, Parameters::Builder()
+                  .Add(UserInitiatedAbortCause("Too many retransmissions"))
+                  .Build())));
+    InternalClose(ErrorKind::kTooManyRetries, "Too many retransmissions");
   }
 
   void DcSctpSocket::InternalClose(ErrorKind error, absl::string_view message)
   {
-    if (state_ != State::kClosed)
+    if (state_ == State::kClosed)
     {
-      t1_init_->Stop();
-      t1_cookie_->Stop();
-      t2_shutdown_->Stop();
-      tcb_ = nullptr;
-
-      if (error == ErrorKind::kNoError)
-      {
-        callbacks_.OnClosed();
-      }
-      else
-      {
-        callbacks_.OnAborted(error, message);
-      }
-      SetState(State::kClosed, message);
+      return;
     }
-    // This method's purpose is to abort/close and make it consistent by ensuring
-    // that e.g. all timers really are stopped.
+
+    // 使用RAII模式确保资源清理的异常安全性
+    try
+    {
+      // 停止所有定时器
+      StopAllTimers();
+
+      // 清理TCB资源
+      CleanupTcb();
+
+      // 更新状态
+      SetState(State::kClosed, message);
+
+      // 通知回调
+      NotifyConnectionClosed(error, message);
+    }
+    catch (...)
+    {
+      // 即使在异常情况下也要确保状态一致性
+      SetState(State::kClosed, "Exception during close");
+      throw;
+    }
+
+    // 确保最终状态一致
     RTC_DCHECK(IsConsistent());
+  }
+
+  void DcSctpSocket::StopAllTimers()
+  {
+    t1_init_->Stop();
+    t1_cookie_->Stop();
+    t2_shutdown_->Stop();
+  }
+
+  void DcSctpSocket::CleanupTcb()
+  {
+    tcb_.reset(); // 使用 reset() 而不是 = nullptr，更明确表达意图
+  }
+
+  void DcSctpSocket::NotifyConnectionClosed(ErrorKind error, absl::string_view message)
+  {
+    if (error == ErrorKind::kNoError)
+    {
+      callbacks_.OnClosed();
+    }
+    else
+    {
+      callbacks_.OnAborted(error, message);
+    }
   }
 
   void DcSctpSocket::SetStreamPriority(StreamID stream_id,
@@ -613,54 +561,101 @@ namespace dcsctp
   {
     RTC_DCHECK_RUN_ON(&thread_checker_);
     CallbackDeferrer::ScopedDeferrer deferrer(callbacks_);
-    LifecycleId lifecycle_id = send_options.lifecycle_id;
 
-    // Validate message for sending
-    auto validation_result = ValidateMessageForSending(message, options_, state_);
-    if (!validation_result.is_valid)
+    // 使用 RAII 模式确保 lifecycle 在所有错误路径中都被正确处理
+    LifecycleGuard lifecycle_guard(send_options.lifecycle_id, callbacks_);
+
+    // 验证消息有效性
+    if (auto status = ValidateMessage(message); status != SendStatus::kSuccess)
     {
-      CleanupLifecycleIfSet(callbacks_, lifecycle_id);
-
-      // Map validation results to error messages
-      switch (validation_result.status)
-      {
-      case SendStatus::kErrorMessageEmpty:
-        callbacks_.OnError(ErrorKind::kProtocolViolation,
-                           "Unable to send empty message");
-        break;
-      case SendStatus::kErrorMessageTooLarge:
-        callbacks_.OnError(ErrorKind::kProtocolViolation,
-                           "Unable to send too large message");
-        break;
-      case SendStatus::kErrorShuttingDown:
-        callbacks_.OnError(ErrorKind::kWrongSequence,
-                           "Unable to send message as the socket is shutting down");
-        break;
-      default:
-        break;
-      }
-      return validation_result.status;
+      return status;
     }
 
+    // 检查连接状态
+    if (IsShuttingDown())
+    {
+      callbacks_.OnError(ErrorKind::kWrongSequence,
+                         "Unable to send message as the socket is shutting down");
+      return SendStatus::kErrorShuttingDown;
+    }
+
+    // 检查发送队列状态
     if (send_queue_.IsFull())
     {
-      CleanupLifecycleIfSet(callbacks_, lifecycle_id);
       callbacks_.OnError(ErrorKind::kResourceExhaustion,
                          "Unable to send message as the send queue is full");
       return SendStatus::kErrorResourceExhaustion;
     }
 
+    // 执行发送操作
     TimeMs now = callbacks_.TimeMillis();
     ++metrics_.tx_messages_count;
     send_queue_.Add(now, std::move(message), send_options);
+
     if (tcb_ != nullptr)
     {
       tcb_->SendBufferedPackets(now);
     }
 
+    // 发送成功，取消 lifecycle guard
+    lifecycle_guard.Success();
+
     RTC_DCHECK(IsConsistent());
     return SendStatus::kSuccess;
   }
+
+  SendStatus DcSctpSocket::ValidateMessage(const DcSctpMessage &message) const
+  {
+    if (message.payload().empty())
+    {
+      callbacks_.OnError(ErrorKind::kProtocolViolation,
+                         "Unable to send empty message");
+      return SendStatus::kErrorMessageEmpty;
+    }
+
+    if (message.payload().size() > options_.max_message_size)
+    {
+      callbacks_.OnError(ErrorKind::kProtocolViolation,
+                         "Unable to send too large message");
+      return SendStatus::kErrorMessageTooLarge;
+    }
+
+    return SendStatus::kSuccess;
+  }
+
+  bool DcSctpSocket::IsShuttingDown() const
+  {
+    return state_ == State::kShutdownPending ||
+           state_ == State::kShutdownSent ||
+           state_ == State::kShutdownReceived ||
+           state_ == State::kShutdownAckSent;
+  }
+
+  // RAII 类用于管理 lifecycle
+  class DcSctpSocket::LifecycleGuard
+  {
+  public:
+    LifecycleGuard(LifecycleId lifecycle_id, CallbackDeferrer &callbacks)
+        : lifecycle_id_(lifecycle_id), callbacks_(callbacks), should_end_(lifecycle_id.IsSet()) {}
+
+    ~LifecycleGuard()
+    {
+      if (should_end_)
+      {
+        callbacks_.OnLifecycleEnd(lifecycle_id_);
+      }
+    }
+
+    void Success()
+    {
+      should_end_ = false; // 成功时不需要结束 lifecycle
+    }
+
+  private:
+    LifecycleId lifecycle_id_;
+    CallbackDeferrer &callbacks_;
+    bool should_end_;
+  };
 
   ResetStreamsStatus DcSctpSocket::ResetStreams(
       rtc::ArrayView<const StreamID> outgoing_streams)
@@ -758,15 +753,15 @@ namespace dcsctp
 
   void DcSctpSocket::MaybeSendShutdownOnPacketReceived(const SctpPacket &packet)
   {
-    if (state_ != State::kShutdownSent)
+    if (state_ == State::kShutdownSent)
     {
-      return;
-    }
-
-    // Check for DATA chunks more efficiently using early exit
-    for (const auto &descriptor : packet.descriptors())
-    {
-      if (descriptor.type == DataChunk::kType)
+      bool has_data_chunk =
+          std::find_if(packet.descriptors().begin(), packet.descriptors().end(),
+                       [](const SctpPacket::ChunkDescriptor &descriptor)
+                       {
+                         return descriptor.type == DataChunk::kType;
+                       }) != packet.descriptors().end();
+      if (has_data_chunk)
       {
         // https://tools.ietf.org/html/rfc4960#section-9.2
         // "While in the SHUTDOWN-SENT state, the SHUTDOWN sender MUST immediately
@@ -775,7 +770,6 @@ namespace dcsctp
         SendShutdown();
         t2_shutdown_->set_duration(tcb_->current_rto());
         t2_shutdown_->Start();
-        return; // Early exit once we find the first DATA chunk
       }
     }
   }
@@ -997,63 +991,36 @@ namespace dcsctp
   bool DcSctpSocket::Dispatch(const CommonHeader &header,
                               const SctpPacket::ChunkDescriptor &descriptor)
   {
-    switch (descriptor.type)
+    // 使用函数指针映射表提高性能，避免长switch语句
+    using ChunkHandler = void (DcSctpSocket::*)(const CommonHeader &, const SctpPacket::ChunkDescriptor &);
+
+    static const std::unordered_map<uint8_t, ChunkHandler> kChunkHandlers = {
+        {DataChunk::kType, &DcSctpSocket::HandleData},
+        {InitChunk::kType, &DcSctpSocket::HandleInit},
+        {InitAckChunk::kType, &DcSctpSocket::HandleInitAck},
+        {SackChunk::kType, &DcSctpSocket::HandleSack},
+        {HeartbeatRequestChunk::kType, &DcSctpSocket::HandleHeartbeatRequest},
+        {HeartbeatAckChunk::kType, &DcSctpSocket::HandleHeartbeatAck},
+        {AbortChunk::kType, &DcSctpSocket::HandleAbort},
+        {ErrorChunk::kType, &DcSctpSocket::HandleError},
+        {CookieEchoChunk::kType, &DcSctpSocket::HandleCookieEcho},
+        {CookieAckChunk::kType, &DcSctpSocket::HandleCookieAck},
+        {ShutdownChunk::kType, &DcSctpSocket::HandleShutdown},
+        {ShutdownAckChunk::kType, &DcSctpSocket::HandleShutdownAck},
+        {ShutdownCompleteChunk::kType, &DcSctpSocket::HandleShutdownComplete},
+        {ReConfigChunk::kType, &DcSctpSocket::HandleReconfig},
+        {ForwardTsnChunk::kType, &DcSctpSocket::HandleForwardTsn},
+        {IDataChunk::kType, &DcSctpSocket::HandleIData},
+        {IForwardTsnChunk::kType, &DcSctpSocket::HandleIForwardTsn}};
+
+    auto it = kChunkHandlers.find(descriptor.type);
+    if (it != kChunkHandlers.end())
     {
-    case DataChunk::kType:
-      HandleData(header, descriptor);
-      break;
-    case InitChunk::kType:
-      HandleInit(header, descriptor);
-      break;
-    case InitAckChunk::kType:
-      HandleInitAck(header, descriptor);
-      break;
-    case SackChunk::kType:
-      HandleSack(header, descriptor);
-      break;
-    case HeartbeatRequestChunk::kType:
-      HandleHeartbeatRequest(header, descriptor);
-      break;
-    case HeartbeatAckChunk::kType:
-      HandleHeartbeatAck(header, descriptor);
-      break;
-    case AbortChunk::kType:
-      HandleAbort(header, descriptor);
-      break;
-    case ErrorChunk::kType:
-      HandleError(header, descriptor);
-      break;
-    case CookieEchoChunk::kType:
-      HandleCookieEcho(header, descriptor);
-      break;
-    case CookieAckChunk::kType:
-      HandleCookieAck(header, descriptor);
-      break;
-    case ShutdownChunk::kType:
-      HandleShutdown(header, descriptor);
-      break;
-    case ShutdownAckChunk::kType:
-      HandleShutdownAck(header, descriptor);
-      break;
-    case ShutdownCompleteChunk::kType:
-      HandleShutdownComplete(header, descriptor);
-      break;
-    case ReConfigChunk::kType:
-      HandleReconfig(header, descriptor);
-      break;
-    case ForwardTsnChunk::kType:
-      HandleForwardTsn(header, descriptor);
-      break;
-    case IDataChunk::kType:
-      HandleIData(header, descriptor);
-      break;
-    case IForwardTsnChunk::kType:
-      HandleIForwardTsn(header, descriptor);
-      break;
-    default:
-      return HandleUnrecognizedChunk(descriptor);
+      (this->*(it->second))(header, descriptor);
+      return true;
     }
-    return true;
+
+    return HandleUnrecognizedChunk(descriptor);
   }
 
   bool DcSctpSocket::HandleUnrecognizedChunk(
@@ -1160,9 +1127,11 @@ namespace dcsctp
       // chunk to the protocol parameter 'Association.Max.Retrans'. If this
       // threshold is exceeded, the endpoint should destroy the TCB..."
 
-      packet_sender_.Send(CreateAbortChunk(tcb_->peer_verification_tag(),
-                                           options_,
-                                           kTooManyShutdownRetransmissionsMessage));
+      packet_sender_.Send(tcb_->PacketBuilder().Add(
+          AbortChunk(true, Parameters::Builder()
+                               .Add(UserInitiatedAbortCause(
+                                   "Too many retransmissions of SHUTDOWN"))
+                               .Build())));
 
       InternalClose(ErrorKind::kTooManyRetries, "No SHUTDOWN_ACK received");
       RTC_DCHECK(IsConsistent());
@@ -1251,6 +1220,28 @@ namespace dcsctp
     AnyDataChunk::ImmediateAckFlag immediate_ack = chunk.options().immediate_ack;
     Data data = std::move(chunk).extract();
 
+    // 验证数据块的有效性
+    if (!ValidateDataChunk(data, tsn))
+    {
+      return;
+    }
+
+    LogDataChunkInfo();
+
+    // 检查重组队列状态
+    auto queue_status = CheckReassemblyQueueStatus(tsn);
+    if (queue_status != ReassemblyQueueStatus::kOk)
+    {
+      HandleReassemblyQueueError(queue_status);
+      return;
+    }
+
+    // 处理数据块
+    ProcessValidDataChunk(tsn, std::move(data), immediate_ack);
+  }
+
+  bool DcSctpSocket::ValidateDataChunk(const Data &data, TSN tsn)
+  {
     if (data.payload.empty())
     {
       // Empty DATA chunks are illegal.
@@ -1258,9 +1249,21 @@ namespace dcsctp
           ErrorChunk(Parameters::Builder().Add(NoUserDataCause(tsn)).Build())));
       callbacks_.OnError(ErrorKind::kProtocolViolation,
                          "Received DATA chunk with no user data");
-      return;
+      return false;
     }
 
+    if (!tcb_->data_tracker().IsTSNValid(tsn))
+    {
+      RTC_DLOG(LS_VERBOSE) << log_prefix()
+                           << "Rejected data because of failing TSN validity";
+      return false;
+    }
+
+    return true;
+  }
+
+  void DcSctpSocket::LogDataChunkInfo() const
+  {
     RTC_DLOG(LS_VERBOSE) << log_prefix() << "Handle DATA, queue_size="
                          << tcb_->reassembly_queue().queued_bytes()
                          << ", water_mark="
@@ -1268,42 +1271,62 @@ namespace dcsctp
                          << ", full=" << tcb_->reassembly_queue().is_full()
                          << ", above="
                          << tcb_->reassembly_queue().is_above_watermark();
+  }
 
+  enum class DcSctpSocket::ReassemblyQueueStatus
+  {
+    kOk,
+    kFull,
+    kAboveWatermark
+  };
+
+  DcSctpSocket::ReassemblyQueueStatus DcSctpSocket::CheckReassemblyQueueStatus(TSN tsn)
+  {
     if (tcb_->reassembly_queue().is_full())
     {
-      // If the reassembly queue is full, there is nothing that can be done. The
-      // specification only allows dropping gap-ack-blocks, and that's not
-      // likely to help as the socket has been trying to fill gaps since the
-      // watermark was reached.
-      packet_sender_.Send(tcb_->PacketBuilder().Add(AbortChunk(
-          true, Parameters::Builder().Add(OutOfResourceErrorCause()).Build())));
-      InternalClose(ErrorKind::kResourceExhaustion,
-                    "Reassembly Queue is exhausted");
-      return;
+      return ReassemblyQueueStatus::kFull;
     }
 
     if (tcb_->reassembly_queue().is_above_watermark())
     {
       RTC_DLOG(LS_VERBOSE) << log_prefix() << "Is above high watermark";
-      // If the reassembly queue is above its high watermark, only accept data
-      // chunks that increase its cumulative ack tsn in an attempt to fill gaps
-      // to deliver messages.
+
+      // 如果重组队列高于高水位，只接受能增加累积确认TSN的数据块
       if (!tcb_->data_tracker().will_increase_cum_ack_tsn(tsn))
       {
-        RTC_DLOG(LS_VERBOSE) << log_prefix()
-                             << "Rejected data because of exceeding watermark";
-        tcb_->data_tracker().ForceImmediateSack();
-        return;
+        return ReassemblyQueueStatus::kAboveWatermark;
       }
     }
 
-    if (!tcb_->data_tracker().IsTSNValid(tsn))
-    {
-      RTC_DLOG(LS_VERBOSE) << log_prefix()
-                           << "Rejected data because of failing TSN validity";
-      return;
-    }
+    return ReassemblyQueueStatus::kOk;
+  }
 
+  void DcSctpSocket::HandleReassemblyQueueError(ReassemblyQueueStatus status)
+  {
+    switch (status)
+    {
+    case ReassemblyQueueStatus::kFull:
+      // 重组队列已满，无法处理
+      packet_sender_.Send(tcb_->PacketBuilder().Add(AbortChunk(
+          true, Parameters::Builder().Add(OutOfResourceErrorCause()).Build())));
+      InternalClose(ErrorKind::kResourceExhaustion,
+                    "Reassembly Queue is exhausted");
+      break;
+
+    case ReassemblyQueueStatus::kAboveWatermark:
+      RTC_DLOG(LS_VERBOSE) << log_prefix()
+                           << "Rejected data because of exceeding watermark";
+      tcb_->data_tracker().ForceImmediateSack();
+      break;
+
+    default:
+      break;
+    }
+  }
+
+  void DcSctpSocket::ProcessValidDataChunk(TSN tsn, Data data,
+                                           AnyDataChunk::ImmediateAckFlag immediate_ack)
+  {
     if (tcb_->data_tracker().Observe(tsn, immediate_ack))
     {
       tcb_->reassembly_queue().MaybeResetStreamsDeferred(
@@ -1336,9 +1359,13 @@ namespace dcsctp
       // "A receiver of an INIT with the MIS value of 0 SHOULD abort the
       // association."
 
-      packet_sender_.Send(CreateProtocolViolationAbort(VerificationTag(0),
-                                                       options_,
-                                                       kInvalidInitMessage));
+      packet_sender_.Send(
+          SctpPacket::Builder(VerificationTag(0), options_)
+              .Add(AbortChunk(
+                  /*filled_in_verification_tag=*/false,
+                  Parameters::Builder()
+                      .Add(ProtocolViolationCause("INIT malformed"))
+                      .Build())));
       InternalClose(ErrorKind::kProtocolViolation, "Received invalid INIT");
       return;
     }
@@ -1461,9 +1488,13 @@ namespace dcsctp
     auto cookie = chunk->parameters().get<StateCookieParameter>();
     if (!cookie.has_value())
     {
-      packet_sender_.Send(CreateProtocolViolationAbort(connect_params_.verification_tag,
-                                                       options_,
-                                                       kInvalidInitAckMessage));
+      packet_sender_.Send(
+          SctpPacket::Builder(connect_params_.verification_tag, options_)
+              .Add(AbortChunk(
+                  /*filled_in_verification_tag=*/false,
+                  Parameters::Builder()
+                      .Add(ProtocolViolationCause("INIT-ACK malformed"))
+                      .Build())));
       InternalClose(ErrorKind::kProtocolViolation,
                     "InitAck chunk doesn't contain a cookie");
       return;
@@ -1964,9 +1995,14 @@ namespace dcsctp
   {
     if (!tcb_->capabilities().partial_reliability)
     {
-      packet_sender_.Send(CreateProtocolViolationAbort(tcb_->peer_verification_tag(),
-                                                       options_,
-                                                       "I-FORWARD-TSN received, but not indicated during connection establishment"));
+      SctpPacket::Builder b = tcb_->PacketBuilder();
+      b.Add(AbortChunk(/*filled_in_verification_tag=*/true,
+                       Parameters::Builder()
+                           .Add(ProtocolViolationCause(
+                               "I-FORWARD-TSN received, but not indicated "
+                               "during connection establishment"))
+                           .Build()));
+      packet_sender_.Send(b);
 
       callbacks_.OnError(ErrorKind::kProtocolViolation,
                          "Received a FORWARD_TSN without announced peer support");
